@@ -1,0 +1,845 @@
+#!/usr/bin/env python3
+"""evren: unofficial CLI for the EVREN LLM API, v0.4.2"""
+import os
+import sys
+from pathlib import Path
+
+# Re-exec into the dedicated venv if httpx is not importable from this interpreter
+try:
+    import httpx
+except ImportError:
+    venv_python = Path.home() / ".venvs" / "evren" / "bin" / "python"
+    if venv_python.exists() and Path(sys.executable) != venv_python:
+        os.execv(str(venv_python), [str(venv_python), *sys.argv])
+    sys.exit("Error: httpx is not installed. Run: ~/.venvs/evren/bin/pip install httpx")
+
+import argparse
+import base64
+import functools
+import json
+import mimetypes
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+
+VERSION = "0.4.2"
+BASE_URL = "https://evren-llmapi.ssyz.org.tr/v1"
+KEY_ENV_VAR = "EVRENAPI"
+KEYCHAIN_SERVICE = "evren"
+CONFIG_PATH = Path.home() / ".config" / "evren" / "config.json"
+
+DEFAULT_MODEL = "qwen3.8-flash-next"
+DEFAULT_VISION_MODEL = "gemma-4-31b"
+DEFAULT_OCR_MODEL = "dots-ocr"
+DEFAULT_ASR_MODEL = "qwen3-asr-1.7b"
+
+# kind -> (environment variable, config key, built-in default)
+MODEL_KINDS = {
+    "text": ("EVREN_MODEL", "model", DEFAULT_MODEL),
+    "vision": ("EVREN_VISION_MODEL", "vision_model", DEFAULT_VISION_MODEL),
+    "ocr": ("EVREN_OCR_MODEL", "ocr_model", DEFAULT_OCR_MODEL),
+    "asr": ("EVREN_ASR_MODEL", "asr_model", DEFAULT_ASR_MODEL),
+}
+
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+MIME_BY_EXT = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+EXT_BY_MIME = {mime: ext for ext, mime in MIME_BY_EXT.items() if ext != ".jpeg"}
+CONVERT_EXTS = {".heic", ".heif"}
+MAX_RAW_BYTES = 4 * 1024 * 1024        # resize images larger than this
+MAX_REQUEST_BYTES = 19 * 1024 * 1024   # server limit is 20 MB
+
+
+# ---------------------------------------------------------------- config
+
+def load_config():
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(cfg):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+
+
+def resolve_model(kind, flag=None):
+    """Return (model, source). Order: flag > env > config file > built-in default."""
+    env_name, cfg_key, default = MODEL_KINDS[kind]
+    if flag:
+        return flag, "-m flag"
+    if os.environ.get(env_name):
+        return os.environ[env_name], f"{env_name} environment variable"
+    cfg = load_config()
+    if cfg.get(cfg_key):
+        return cfg[cfg_key], str(CONFIG_PATH)
+    return default, "built-in default"
+
+
+# ---------------------------------------------------------------- http
+
+@functools.lru_cache(maxsize=1)
+def find_api_key():
+    """Return (key, source). Order: environment variable, then macOS Keychain."""
+    key = os.environ.get(KEY_ENV_VAR)
+    if key:
+        return key, f"{KEY_ENV_VAR} environment variable"
+    if shutil.which("security"):
+        result = subprocess.run(
+            ["security", "find-generic-password", "-a", os.environ.get("USER", ""),
+             "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip(), "macOS Keychain"
+    return None, None
+
+
+def get_api_key():
+    key, _ = find_api_key()
+    if not key:
+        sys.exit(
+            "Error: no API key found.\n"
+            f'Option 1: add to ~/.zshrc:  export {KEY_ENV_VAR}="evren_llm_..."\n'
+            f'Option 2: store it in the macOS Keychain:  security add-generic-password -a "$USER" -s {KEYCHAIN_SERVICE} -w'
+        )
+    return key
+
+
+def auth_headers():
+    return {"Authorization": f"Bearer {get_api_key()}"}
+
+
+def explain_http_error(status, body_text):
+    try:
+        err = json.loads(body_text).get("error", {})
+    except (json.JSONDecodeError, AttributeError):
+        err = {}
+    if not isinstance(err, dict):
+        err = {"message": str(err)}
+    detail = err.get("message", body_text[:300])
+    extra = err.get("evren")
+    marker = json.dumps(err) if err else body_text
+
+    if status == 403 and "terms_not_accepted" in marker:
+        msg = "Terms of use are not accepted. Check with `evren terms`."
+    elif status == 401:
+        msg = "Invalid or missing API key (401). Check your key."
+    elif status == 429:
+        msg = "Account quota exhausted (429). Check `evren quota` or wait."
+    elif status == 503:
+        msg = "Server is busy right now (503). Retry in a few seconds."
+    elif status == 413:
+        msg = "Request is too large (413). Use a smaller file."
+    elif status == 400:
+        msg = "Request rejected (400). The model may not support this input type."
+    else:
+        msg = f"Request failed (HTTP {status})."
+    out = f"Error: {msg}\nServer message: {detail}"
+    if extra:
+        out += f"\nExtra info (evren): {json.dumps(extra, ensure_ascii=False)}"
+    return out
+
+
+def api_get(path):
+    with httpx.Client(timeout=30) as client:
+        resp = client.get(f"{BASE_URL}{path}", headers=auth_headers())
+    if resp.status_code != 200:
+        sys.exit(explain_http_error(resp.status_code, resp.text))
+    return resp
+
+
+def list_models():
+    """Return the raw model entries from /models."""
+    data = api_get("/models").json()
+    items = data.get("data", []) if isinstance(data, dict) else data
+    return [m if isinstance(m, dict) else {"id": str(m)} for m in items]
+
+
+def list_model_ids():
+    return [m.get("id") for m in list_models()]
+
+
+def emit(text, output_path):
+    """Write text to a file if requested, otherwise to stdout."""
+    if output_path:
+        Path(output_path).expanduser().write_text(text.rstrip("\n") + "\n")
+        sys.stderr.write(f"{DIM}Saved to {output_path}{RESET}\n")
+    else:
+        sys.stdout.write(text.rstrip("\n") + "\n")
+
+
+# ---------------------------------------------------------------- chat core
+
+def add_chat_options(parser):
+    parser.add_argument("-m", "--model", default=None, help="model (overrides the default)")
+    parser.add_argument("-s", "--system", default=None, help="system prompt")
+    parser.add_argument("-t", "--max-tokens", type=int, default=4096)
+    think = parser.add_mutually_exclusive_group()
+    think.add_argument("--think", dest="think", action="store_true", default=None)
+    think.add_argument("--no-think", dest="think", action="store_false")
+    parser.add_argument("--show-thinking", action="store_true",
+                        help="show the model's thinking text (hidden by default; --think also shows it)")
+    parser.add_argument("--stream", action="store_true", help="stream the answer as it is generated")
+    parser.add_argument("--no-stream", action="store_true", help=argparse.SUPPRESS)
+
+
+def print_stats(model, start, ttft, usage, remaining):
+    stats = [f"time {time.monotonic() - start:.1f}s"]
+    if ttft is not None:
+        stats.append(f"first token {ttft:.2f}s")
+    if usage:
+        stats.append(f"prompt {usage.get('prompt_tokens')} / completion {usage.get('completion_tokens')} tokens")
+    if remaining:
+        try:
+            stats.append(f"daily quota left (at request start) {int(remaining):,}")
+        except ValueError:
+            pass
+    sys.stderr.write(f"{DIM}[{model}] " + " | ".join(stats) + f"{RESET}\n")
+
+
+def report_finish(got_content, finish_reason):
+    if not got_content:
+        hint = ""
+        if finish_reason == "length":
+            hint = " The model used up its token budget while thinking; raise -t (e.g. -t 8192)."
+        sys.stderr.write(f"Warning: empty answer (finish_reason={finish_reason}).{hint}\n")
+    elif finish_reason == "length":
+        sys.stderr.write("Warning: answer was cut off at max_tokens; raise -t.\n")
+
+
+def run_chat(model, messages, args):
+    """Send the conversation and return the assistant's answer text."""
+    body = {"model": model, "messages": messages, "max_tokens": args.max_tokens}
+    if args.think is not None:
+        body["thinking"] = args.think
+    # Thinking text is hidden unless explicitly requested
+    show = args.think is True or args.show_thinking
+    if args.stream and not args.no_stream:
+        return run_streaming(model, body, show)
+    return run_blocking(model, body, show)
+
+
+def run_blocking(model, body, show_reasoning=False):
+    start = time.monotonic()
+    timeout = httpx.Timeout(connect=15, read=300, write=60, pool=15)
+    with httpx.Client(timeout=timeout) as client:
+        resp = client.post(f"{BASE_URL}/chat/completions", json=body, headers=auth_headers())
+    if resp.status_code != 200:
+        sys.exit(explain_http_error(resp.status_code, resp.text))
+    data = resp.json()
+    choice = (data.get("choices") or [{}])[0]
+    msg = choice.get("message", {})
+    reasoning = msg.get("reasoning") or msg.get("reasoning_content")
+    content = msg.get("content") or ""
+    if reasoning and show_reasoning:
+        sys.stderr.write(f"{DIM}{reasoning.strip()}{RESET}\n\n")
+    if content:
+        sys.stdout.write(content.strip() + "\n")
+    report_finish(bool(content), choice.get("finish_reason"))
+    print_stats(model, start, None, data.get("usage"), resp.headers.get("x-evren-daily-remaining-tokens"))
+    return content
+
+
+def run_streaming(model, body, show_reasoning=False):
+    body = dict(body, stream=True, stream_options={"include_usage": True})
+    start = time.monotonic()
+    first_token_at = None
+    usage = None
+    finish_reason = None
+    parts = []
+    in_reasoning = False
+    remaining = None
+
+    timeout = httpx.Timeout(connect=15, read=120, write=60, pool=15)
+    with httpx.Client(timeout=timeout) as client:
+        with client.stream("POST", f"{BASE_URL}/chat/completions", json=body, headers=auth_headers()) as resp:
+            if resp.status_code != 200:
+                resp.read()
+                sys.exit(explain_http_error(resp.status_code, resp.text))
+            remaining = resp.headers.get("x-evren-daily-remaining-tokens")
+            for line in resp.iter_lines():
+                # Skip blanks and SSE comments such as ": keep-alive"
+                if not line or line.startswith(":") or not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                for choice in chunk.get("choices", []):
+                    delta = choice.get("delta", {})
+                    reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+                    content = delta.get("content")
+                    if reasoning:
+                        first_token_at = first_token_at or time.monotonic()
+                        if show_reasoning:
+                            in_reasoning = True
+                            sys.stderr.write(f"{DIM}{reasoning}{RESET}")
+                            sys.stderr.flush()
+                    if content:
+                        first_token_at = first_token_at or time.monotonic()
+                        if in_reasoning:
+                            sys.stderr.write("\n")
+                            in_reasoning = False
+                        parts.append(content)
+                        sys.stdout.write(content)
+                        sys.stdout.flush()
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+
+    if parts:
+        sys.stdout.write("\n")
+    report_finish(bool(parts), finish_reason)
+    ttft = (first_token_at - start) if first_token_at else None
+    print_stats(model, start, ttft, usage, remaining)
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------- ask
+
+def cmd_ask(argv):
+    parser = argparse.ArgumentParser(prog="evren ask", description="ask the model a question")
+    parser.add_argument("prompt", nargs="*", help="question")
+    add_chat_options(parser)
+    args = parser.parse_args(argv)
+
+    parts = []
+    if not sys.stdin.isatty():
+        piped = sys.stdin.read().strip()
+        if piped:
+            parts.append(piped)
+    if args.prompt:
+        parts.append(" ".join(args.prompt))
+    if not parts:
+        sys.exit('Error: no question given. Usage: evren "question"  or  cat file | evren "summarize"')
+
+    model, _ = resolve_model("text", args.model)
+    messages = []
+    if args.system:
+        messages.append({"role": "system", "content": args.system})
+    messages.append({"role": "user", "content": "\n\n".join(parts)})
+    run_chat(model, messages, args)
+
+
+# ---------------------------------------------------------------- chat (interactive)
+
+CHAT_HELP = """\
+/help             show this help
+/exit, /quit      leave the chat (Ctrl-D works too)
+/clear            forget the conversation (the system prompt is kept)
+/model [name]     show or change the model for this session
+/think on|off|auto  control thinking for this session
+/system <text>    replace the system prompt and clear the conversation"""
+
+
+def cmd_chat(argv):
+    parser = argparse.ArgumentParser(prog="evren chat", description="interactive chat with history")
+    add_chat_options(parser)
+    args = parser.parse_args(argv)
+
+    if not sys.stdin.isatty():
+        sys.exit("Error: chat needs an interactive terminal. Use `evren ask` for piped input.")
+    try:
+        import readline  # noqa: F401  (enables line editing and arrow-key history)
+    except ImportError:
+        pass
+
+    model, _ = resolve_model("text", args.model)
+    system = args.system
+    messages = [{"role": "system", "content": system}] if system else []
+    print(f"evren chat | model: {model} | /help for commands, /exit to quit")
+
+    while True:
+        try:
+            line = input("\nyou> ").strip()
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print("\n(use /exit or Ctrl-D to quit)")
+            continue
+        if not line:
+            continue
+
+        if line.startswith("/"):
+            cmd, _, rest = line.partition(" ")
+            rest = rest.strip()
+            if cmd in ("/exit", "/quit"):
+                break
+            elif cmd == "/help":
+                print(CHAT_HELP)
+            elif cmd == "/clear":
+                messages = [{"role": "system", "content": system}] if system else []
+                print("Conversation cleared.")
+            elif cmd == "/model":
+                if rest:
+                    model = rest
+                print(f"Model: {model}")
+            elif cmd == "/think":
+                if rest in ("on", "off", "auto"):
+                    args.think = {"on": True, "off": False, "auto": None}[rest]
+                    print(f"Thinking: {rest}")
+                else:
+                    print("Usage: /think on|off|auto")
+            elif cmd == "/system":
+                system = rest or None
+                messages = [{"role": "system", "content": system}] if system else []
+                print("System prompt updated, conversation cleared.")
+            else:
+                print("Unknown command. Type /help.")
+            continue
+
+        messages.append({"role": "user", "content": line})
+        print()
+        try:
+            reply = run_chat(model, messages, args)
+        except KeyboardInterrupt:
+            messages.pop()
+            print("\n(interrupted)")
+            continue
+        except SystemExit as exc:
+            messages.pop()
+            if exc.code:
+                sys.stderr.write(f"{exc.code}\n")
+            continue
+        except httpx.HTTPError as exc:
+            messages.pop()
+            sys.stderr.write(f"Error: connection problem ({exc.__class__.__name__}).\n")
+            continue
+        if reply:
+            messages.append({"role": "assistant", "content": reply})
+        else:
+            messages.pop()
+
+
+# ---------------------------------------------------------------- images (img, ocr)
+
+def is_url(value):
+    return value.startswith(("http://", "https://"))
+
+
+def prepare_image(path_str, resize):
+    """Return (bytes, mime) for an image file, converting/shrinking via macOS sips when needed."""
+    path = Path(path_str).expanduser()
+    ext = path.suffix.lower()
+    if ext not in MIME_BY_EXT and ext not in CONVERT_EXTS:
+        sys.exit(f"Error: unsupported image type '{ext}'. Supported: jpg, png, webp, gif, heic.")
+
+    work_path = path
+    mime = MIME_BY_EXT.get(ext, "image/jpeg")
+    tmp_name = None
+    needs_convert = ext in CONVERT_EXTS
+    too_big = path.stat().st_size > MAX_RAW_BYTES
+
+    if needs_convert or (resize and too_big):
+        if not resize and needs_convert:
+            sys.exit("Error: --no-resize cannot be used with HEIC files (they must be converted to JPEG).")
+        if shutil.which("sips") is None:
+            sys.exit("Error: the macOS 'sips' tool is required to resize/convert images.")
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        tmp.close()
+        tmp_name = tmp.name
+        result = subprocess.run(
+            ["sips", "-Z", "2048", "-s", "format", "jpeg", str(path), "--out", tmp_name],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            os.unlink(tmp_name)
+            sys.exit(f"Error: sips failed: {result.stderr.strip()}")
+        work_path = Path(tmp_name)
+        mime = "image/jpeg"
+        sys.stderr.write(f"{DIM}{path.name}: resized/converted to JPEG (max 2048 px){RESET}\n")
+
+    try:
+        data = work_path.read_bytes()
+    finally:
+        if tmp_name:
+            os.unlink(tmp_name)
+    return data, mime
+
+
+def encode_image(path_str, resize):
+    data, mime = prepare_image(path_str, resize)
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def warn_if_model_lacks(model, task, modality):
+    """Warn (never block) when /models metadata says the model does not fit the job."""
+    try:
+        entry = next((m for m in list_models() if m.get("id") == model), None)
+    except SystemExit:
+        return
+    if not entry:
+        return
+    mods = entry.get("modalities") or []
+    caps = entry.get("capabilities") or {}
+    chat_like = entry.get("task") in (task, "vision_chat")
+    ok = chat_like and (modality in mods or caps.get("vision"))
+    if not ok:
+        sys.stderr.write(
+            f"Warning: '{model}' does not look like an image-capable chat model "
+            f"(task: {entry.get('task')}, inputs: {', '.join(mods) or '?'}). Trying anyway. "
+            "See `evren models`.\n"
+        )
+
+
+def cmd_img(argv):
+    parser = argparse.ArgumentParser(prog="evren img", description="ask a question about image(s)")
+    parser.add_argument("items", nargs="+", help="image files/URLs, then the question last")
+    parser.add_argument("--no-resize", dest="resize", action="store_false", help="do not shrink large images")
+    add_chat_options(parser)
+    args = parser.parse_args(argv)
+
+    images = [i for i in args.items if is_url(i) or Path(i).expanduser().is_file()]
+    rest = [i for i in args.items if i not in images]
+    if not images:
+        sys.exit(f"Error: image file not found: '{args.items[0]}'. Usage: evren img photo.jpg \"question\"")
+    question = " ".join(rest) or "What is in this image? Describe it in detail."
+
+    content = []
+    total = 0
+    for item in images:
+        url = item if is_url(item) else encode_image(item, args.resize)
+        total += len(url)
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    if total > MAX_REQUEST_BYTES:
+        sys.exit(f"Error: images total {total / 1048576:.1f} MB, over the 20 MB limit. Use fewer/smaller images.")
+    content.append({"type": "text", "text": question})
+
+    model, _ = resolve_model("vision", args.model)
+    warn_if_model_lacks(model, "chat", "image")
+    messages = []
+    if args.system:
+        messages.append({"role": "system", "content": args.system})
+    messages.append({"role": "user", "content": content})
+    run_chat(model, messages, args)
+
+
+def warn_if_degenerate(text, label):
+    """OCR models can fall into repetition loops on dense or noisy images."""
+    if re.search(r"(.{2,30}?)\1{30,}", text[:20000], re.S):
+        sys.stderr.write(
+            f"Warning: the OCR output for '{label}' looks like a repetition loop. "
+            "Try a cleaner or cropped image, or another model (-m deepseek-ocr-2).\n"
+        )
+
+
+def cmd_ocr(argv):
+    parser = argparse.ArgumentParser(prog="evren ocr", description="extract text from image(s)")
+    parser.add_argument("files", nargs="+", help="image files")
+    parser.add_argument("-m", "--model", default=None, help="OCR model (default: dots-ocr)")
+    parser.add_argument("-o", "--output", default=None, help="write the text to this file")
+    parser.add_argument("--no-resize", dest="resize", action="store_false", help="do not shrink large images")
+    args = parser.parse_args(argv)
+
+    model, _ = resolve_model("ocr", args.model)
+    timeout = httpx.Timeout(connect=15, read=300, write=60, pool=15)
+    results = []
+    for item in args.files:
+        if not Path(item).expanduser().is_file():
+            sys.exit(f"Error: file not found: '{item}'.")
+        data, mime = prepare_image(item, args.resize)
+        filename = "image" + EXT_BY_MIME.get(mime, ".jpg")
+        start = time.monotonic()
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(
+                f"{BASE_URL}/ocr",
+                data={"model": model},
+                files={"file": (filename, data, mime)},
+                headers=auth_headers(),
+            )
+        if resp.status_code != 200:
+            sys.exit(explain_http_error(resp.status_code, resp.text))
+        text = resp.json().get("text") or ""
+        warn_if_degenerate(text, Path(item).name)
+        results.append((Path(item).name, text))
+        sys.stderr.write(f"{DIM}[{model}] {Path(item).name}: time {time.monotonic() - start:.1f}s{RESET}\n")
+
+    if len(results) == 1:
+        out = results[0][1]
+    else:
+        out = "\n\n".join(f"=== {name} ===\n{text}" for name, text in results)
+    emit(out, args.output)
+
+
+# ---------------------------------------------------------------- transcribe
+
+def cmd_transcribe(argv):
+    parser = argparse.ArgumentParser(prog="evren transcribe", description="speech to text")
+    parser.add_argument("file", help="audio file")
+    parser.add_argument("-m", "--model", default=None, help="ASR model (default: qwen3-asr-1.7b)")
+    parser.add_argument("-l", "--language", default=None, help="ISO 639-1 language hint, e.g. tr, en")
+    parser.add_argument("-f", "--format", default="json",
+                        choices=["json", "text", "srt", "verbose_json", "diarized_json"])
+    parser.add_argument("-p", "--prompt", default=None, help="text to guide style or vocabulary")
+    parser.add_argument("-o", "--output", default=None, help="write the result to this file")
+    args = parser.parse_args(argv)
+
+    path = Path(args.file).expanduser()
+    if not path.is_file():
+        sys.exit(f"Error: file not found: '{args.file}'.")
+    size = path.stat().st_size
+    if size > 20 * 1024 * 1024:
+        sys.stderr.write(
+            f"Warning: file is {size / 1048576:.1f} MB; the server may reject large uploads "
+            "(this tool does not support the /media upload flow yet).\n"
+        )
+
+    model, _ = resolve_model("asr", args.model)
+    form = {"model": model}
+    if args.language:
+        form["language"] = args.language
+    if args.prompt:
+        form["prompt"] = args.prompt
+    if args.format != "json":
+        form["response_format"] = args.format
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+
+    start = time.monotonic()
+    timeout = httpx.Timeout(connect=15, read=900, write=300, pool=15)
+    with httpx.Client(timeout=timeout) as client, path.open("rb") as handle:
+        resp = client.post(
+            f"{BASE_URL}/audio/transcriptions",
+            data=form,
+            files={"file": (path.name, handle, mime)},
+            headers=auth_headers(),
+        )
+    if resp.status_code != 200:
+        sys.exit(explain_http_error(resp.status_code, resp.text))
+
+    if args.format == "json":
+        text = resp.json().get("text") or ""
+    elif args.format in ("verbose_json", "diarized_json"):
+        text = json.dumps(resp.json(), indent=2, ensure_ascii=False)
+    else:
+        text = resp.text
+    emit(text, args.output)
+    sys.stderr.write(f"{DIM}[{model}] time {time.monotonic() - start:.1f}s | {size / 1024:.0f} KB{RESET}\n")
+
+
+# ---------------------------------------------------------------- models
+
+def human_context(n):
+    if not isinstance(n, int):
+        return "?"
+    if n >= 1048576:
+        return f"{n / 1048576:g}M"
+    return f"{n // 1024}K"
+
+
+def cmd_models(argv):
+    entries = list_models()
+    tags_by_id = {}
+    for kind in MODEL_KINDS:
+        model, _ = resolve_model(kind)
+        tags_by_id.setdefault(model, []).append(kind)
+
+    rows = []
+    free_until = None
+    for m in entries:
+        rows.append((
+            str(m.get("id", "?")),
+            str(m.get("task", "?")),
+            ",".join(m.get("modalities") or []) or "-",
+            human_context(m.get("context_length")),
+            ",".join(tags_by_id.get(m.get("id"), [])),
+        ))
+        free_until = free_until or (m.get("pricing") or {}).get("free_until")
+    header = ("MODEL", "TASK", "INPUTS", "CONTEXT", "DEFAULT FOR")
+    widths = [max(len(r[i]) for r in rows + [header]) for i in range(4)]
+    for row in [header] + rows:
+        cells = [row[i].ljust(widths[i]) for i in range(4)]
+        print("  ".join(cells + [row[4]]).rstrip())
+    if free_until:
+        print(f"\nFree of charge until {free_until}.")
+
+
+def cmd_whichmodel(argv):
+    for kind in MODEL_KINDS:
+        model, source = resolve_model(kind)
+        print(f"{kind:<7}: {model}   ({source})")
+
+
+def cmd_setmodel(argv):
+    parser = argparse.ArgumentParser(prog="evren setmodel", description="change a default model")
+    parser.add_argument("name")
+    kind_group = parser.add_mutually_exclusive_group()
+    kind_group.add_argument("--vision", action="store_true", help="vision default (used by `img`)")
+    kind_group.add_argument("--ocr", action="store_true", help="OCR default (used by `ocr`)")
+    kind_group.add_argument("--asr", action="store_true", help="speech-to-text default (used by `transcribe`)")
+    parser.add_argument("--force", action="store_true", help="skip validation against the model list")
+    args = parser.parse_args(argv)
+
+    kind = "vision" if args.vision else "ocr" if args.ocr else "asr" if args.asr else "text"
+    env_name, cfg_key, _ = MODEL_KINDS[kind]
+
+    if not args.force and args.name != "auto":
+        ids = list_model_ids()
+        if ids and args.name not in ids:
+            sys.exit(f"Error: '{args.name}' is not in the model list.\nAvailable models: {', '.join(ids)}\n"
+                     "(Use --force to write it anyway.)")
+    cfg = load_config()
+    cfg[cfg_key] = args.name
+    save_config(cfg)
+    print(f"Default {kind} model: {args.name}")
+    if os.environ.get(env_name):
+        print(f"Note: {env_name} is set and takes priority (see `evren whichmodel`).")
+
+
+# ---------------------------------------------------------------- quota / terms / doctor
+
+def fmt(value):
+    return f"{value:,}" if isinstance(value, int) else str(value)
+
+
+def cmd_quota(argv):
+    q = api_get("/quota").json()
+    print(f"Daily  : {fmt(q.get('daily_used_tokens'))} / {fmt(q.get('daily_limit_tokens'))} used, "
+          f"{fmt(q.get('daily_remaining_tokens'))} left")
+    print(f"         resets: {q.get('daily_reset_at')}")
+    print(f"Window : {fmt(q.get('used_tokens'))} / {fmt(q.get('cap'))} tokens "
+          f"({q.get('window_minutes')} min), level: {q.get('level')}")
+    print(f"         resets: {q.get('reset_at')}")
+
+
+def cmd_terms(argv):
+    parser = argparse.ArgumentParser(prog="evren terms", description="terms of use")
+    parser.add_argument("action", nargs="?", default="status", choices=["status", "text", "accept"])
+    parser.add_argument("--version", type=int, help="terms version for accept (see the status output)")
+    args = parser.parse_args(argv)
+
+    if args.action == "status":
+        print(json.dumps(api_get("/terms/status").json(), indent=2, ensure_ascii=False))
+    elif args.action == "text":
+        resp = api_get("/terms/text")
+        try:
+            print(json.dumps(resp.json(), indent=2, ensure_ascii=False))
+        except ValueError:
+            print(resp.text)
+    else:
+        if args.version is None:
+            sys.exit("Error: check the version with `evren terms` first, then: evren terms accept --version N")
+        answer = input(f"I have read and accept version {args.version} of the terms (type 'yes' to confirm): ")
+        if answer.strip().lower() != "yes":
+            sys.exit("Cancelled, terms were not accepted.")
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(f"{BASE_URL}/terms/accept", json={"version": args.version}, headers=auth_headers())
+        if resp.status_code != 200:
+            sys.exit(explain_http_error(resp.status_code, resp.text))
+        print("Terms accepted.")
+
+
+def cmd_doctor(argv):
+    def line(ok, text):
+        print(f"[{'OK' if ok else '!!'}] {text}")
+
+    key, source = find_api_key()
+    line(bool(key), f"API key found in {source}" if key else "no API key found (env var or Keychain)")
+    if not key:
+        return
+    line(key.startswith("evren_llm_"), "key format starts with evren_llm_")
+
+    with httpx.Client(timeout=30) as client:
+        def probe(path):
+            try:
+                return client.get(f"{BASE_URL}{path}", headers=auth_headers())
+            except httpx.HTTPError as exc:
+                line(False, f"{path}: connection error ({exc.__class__.__name__})")
+                return None
+
+        resp = probe("/models")
+        if resp is not None:
+            line(resp.status_code == 200, f"/models returned HTTP {resp.status_code}")
+        resp = probe("/terms/status")
+        if resp is not None:
+            line(resp.status_code == 200, f"/terms/status returned HTTP {resp.status_code} (details: `evren terms`)")
+        resp = probe("/quota")
+        if resp is not None and resp.status_code == 200:
+            q = resp.json()
+            line(q.get("level") == "ok", f"quota level: {q.get('level')}, daily remaining {fmt(q.get('daily_remaining_tokens'))}")
+        elif resp is not None:
+            line(False, f"/quota returned HTTP {resp.status_code}")
+
+    for kind in MODEL_KINDS:
+        model, src = resolve_model(kind)
+        line(True, f"{kind} model: {model} ({src})")
+
+
+# ---------------------------------------------------------------- help / dispatch
+
+COMMANDS = {
+    "ask": (cmd_ask, "ask the model a question (stdin is read too)"),
+    "chat": (cmd_chat, "interactive chat with history"),
+    "img": (cmd_img, "ask a question about image(s)"),
+    "ocr": (cmd_ocr, "extract text from image(s)"),
+    "transcribe": (cmd_transcribe, "speech to text from an audio file"),
+    "models": (cmd_models, "list models with task, inputs and context size"),
+    "setmodel": (cmd_setmodel, "change a default model (--vision, --ocr, --asr)"),
+    "whichmodel": (cmd_whichmodel, "show active models and where they come from"),
+    "quota": (cmd_quota, "show remaining daily and window quota"),
+    "terms": (cmd_terms, "terms of use status (text, accept)"),
+    "doctor": (cmd_doctor, "check key, connection, terms and quota"),
+}
+
+
+def cmd_help(argv=None):
+    print("USAGE")
+    print("  evren <command> [options]")
+    print('  evren "question"                same as ask')
+    print('  evren img photo.jpg "question"  ask about an image')
+    print("  evren ocr scan.png              extract text")
+    print("  evren transcribe talk.m4a -l tr speech to text")
+    print()
+    print("COMMANDS")
+    for name, (_, desc) in COMMANDS.items():
+        print(f"  {name:<11} {desc}")
+    print("  help        show this help")
+    print()
+    print("OPTIONS (ask, chat, img)")
+    print("  -m model  -s system  -t max_tokens  --stream")
+    print("  --think / --no-think   ask the model to think / not to think (--think also shows it)")
+    print("  --show-thinking        show the thinking text without changing the request")
+    print()
+    print("MODEL PRIORITY")
+    print("  -m  >  EVREN_MODEL (_VISION/_OCR/_ASR)  >  ~/.config/evren/config.json  >  built-in")
+    print()
+    print("API KEY")
+    print(f"  {KEY_ENV_VAR} environment variable, or macOS Keychain (service '{KEYCHAIN_SERVICE}')")
+
+
+def main():
+    argv = sys.argv[1:]
+    try:
+        if not argv or argv[0] in ("help", "-h", "--help"):
+            cmd_help()
+        elif argv[0] in ("--version", "version"):
+            print(f"evren {VERSION}")
+        elif argv[0] in COMMANDS:
+            COMMANDS[argv[0]][0](argv[1:])
+        else:
+            cmd_ask(argv)
+    except httpx.TimeoutException:
+        sys.exit("Error: request timed out. Try again.")
+    except httpx.HTTPError as exc:
+        sys.exit(f"Error: connection problem ({exc.__class__.__name__}).")
+    except KeyboardInterrupt:
+        sys.exit("\nCancelled.")
+
+
+if __name__ == "__main__":
+    main()

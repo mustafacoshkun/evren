@@ -66,7 +66,7 @@ evren img a.jpg b.png "what changed between these two?"
 evren ocr invoice.png -o invoice.txt
 evren transcribe meeting.m4a -l tr -f srt -o meeting.srt
 evren rerank "capital of Turkey" "Ankara is the capital." "Bananas are yellow."
-evren rerank "capital of Turkey" -f candidates.txt -n 3
+evren rerank "capital of Turkey" candidates.txt -n 3   # file with one document per line
 evren chat
 ```
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""evren: unofficial CLI for the EVREN LLM API, v0.5.2"""
+"""evren: unofficial CLI for the EVREN LLM API, v0.5.3"""
 import os
 import sys
 from pathlib import Path
@@ -24,7 +24,7 @@ import subprocess
 import tempfile
 import time
 
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 BASE_URL = "https://evren-llmapi.ssyz.org.tr/v1"
 KEY_ENV_VAR = "EVRENAPI"
 KEYCHAIN_SERVICE = "evren"
@@ -170,6 +170,14 @@ def list_models():
 
 def list_model_ids():
     return [m.get("id") for m in list_models()]
+
+
+def is_existing_file(value):
+    """True if value names an existing file; long texts or odd characters count as not a file."""
+    try:
+        return Path(value).expanduser().is_file()
+    except (OSError, ValueError):
+        return False
 
 
 def emit(text, output_path):
@@ -507,7 +515,7 @@ def cmd_img(argv):
     add_chat_options(parser)
     args = parser.parse_args(argv)
 
-    images = [i for i in args.items if is_url(i) or Path(i).expanduser().is_file()]
+    images = [i for i in args.items if is_url(i) or is_existing_file(i)]
     rest = [i for i in args.items if i not in images]
     if not images:
         sys.exit(f"Error: image file not found: '{args.items[0]}'. Usage: evren img photo.jpg \"question\"")
@@ -646,14 +654,19 @@ def read_lines(path_str):
 def cmd_rerank(argv):
     parser = argparse.ArgumentParser(prog="evren rerank", description="rank documents by relevance to a query")
     parser.add_argument("query", help="the search query")
-    parser.add_argument("documents", nargs="*", help="documents to rank (or use -f / stdin)")
+    parser.add_argument("documents", nargs="*", help="documents or files (one document per line) to rank; or use stdin")
     parser.add_argument("-f", "--file", default=None, help="file with one document per line")
     parser.add_argument("-m", "--model", default=None, help="reranker model (default: qwen3-reranker-8b)")
     parser.add_argument("-n", "--top-n", type=int, default=None, help="return only the best N documents")
     parser.add_argument("--raw", action="store_true", help="print the raw JSON response")
     args = parser.parse_args(argv)
 
-    docs = list(args.documents)
+    docs = []
+    for item in args.documents:
+        if is_existing_file(item):
+            docs += read_lines(item)
+        else:
+            docs.append(item)
     if args.file:
         docs += read_lines(args.file)
     if not docs and not sys.stdin.isatty():
@@ -879,7 +892,7 @@ def cmd_help(argv=None):
     print("  evren ocr scan.png              extract text")
     print("  evren transcribe talk.m4a -l tr speech to text")
     print('  evren rerank "query" "doc 1" "doc 2"   rank documents (best first)')
-    print('  evren rerank "query" -f docs.txt -n 3  documents from a file, top 3')
+    print('  evren rerank "query" docs.txt -n 3     documents from a file (one per line), top 3')
     print('  cat docs.txt | evren rerank "query"    easiest: one document per line on stdin')
     print()
     print("COMMANDS")
@@ -895,7 +908,7 @@ def cmd_help(argv=None):
     print("OTHER OPTIONS")
     print("  ocr         -m model  -o file  --no-resize")
     print("  transcribe  -m model  -l lang  -f format  -p prompt  -o file")
-    print("  rerank      -m model  -f file  -n top_n  --raw   (documents: arguments, -f file or stdin)")
+    print("  rerank      -m model  -f file  -n top_n  --raw   (documents: texts, file names or stdin)")
     print()
     print("MODEL PRIORITY")
     print("  -m  >  EVREN_MODEL (_VISION/_OCR/_ASR/_RERANK)  >  ~/.config/evren/config.json  >  built-in")

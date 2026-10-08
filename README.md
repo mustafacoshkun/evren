@@ -14,6 +14,7 @@ built for macOS and zsh.
 - `evren img photo.jpg "what is in this image?"` image questions (multiple images supported)
 - `evren ocr scan.png` text extraction (`dots-ocr`, `deepseek-ocr-2`)
 - `evren transcribe talk.m4a -l tr` speech to text (`qwen3-asr-1.7b`)
+- `evren rerank "query" -f docs.txt` rank documents by relevance (`qwen3-reranker-8b`)
 - `evren models`, `setmodel`, `whichmodel` to manage defaults
 - `evren quota`, `evren doctor`, `evren terms`
 - The answer goes to stdout (pipe-friendly); thinking text is hidden by default and shown dimmed on stderr with `--think` or `--show-thinking`
@@ -25,7 +26,7 @@ built for macOS and zsh.
 Requirements: macOS, Python 3.9+.
 
 ```bash
-git clone https://github.com/mustafacoshkun/evren.git
+git clone https://github.com/<your-user>/evren.git
 cd evren
 bash install.sh
 ```
@@ -64,6 +65,8 @@ evren --stream "Write a haiku about Ankara"
 evren img a.jpg b.png "what changed between these two?"
 evren ocr invoice.png -o invoice.txt
 evren transcribe meeting.m4a -l tr -f srt -o meeting.srt
+evren rerank "capital of Turkey" "Ankara is the capital." "Bananas are yellow."
+evren rerank "capital of Turkey" -f candidates.txt -n 3
 evren chat
 ```
 
@@ -77,11 +80,12 @@ evren setmodel glm-5.3
 evren setmodel --vision gemma-4-31b
 evren setmodel --ocr dots-ocr
 evren setmodel --asr qwen3-asr-1.7b
+evren setmodel --rerank qwen3-reranker-8b
 evren whichmodel
 ```
 
 Priority: `-m` flag, then `EVREN_MODEL` (or `EVREN_VISION_MODEL`, `EVREN_OCR_MODEL`,
-`EVREN_ASR_MODEL`), then `~/.config/evren/config.json`, then the built-in default.
+`EVREN_ASR_MODEL`, `EVREN_RERANK_MODEL`), then `~/.config/evren/config.json`, then the built-in default.
 
 ### Terms of use
 

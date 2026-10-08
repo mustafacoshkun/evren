@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""evren: unofficial CLI for the EVREN LLM API, v0.4.2"""
+"""evren: unofficial CLI for the EVREN LLM API, v0.5.0"""
 import os
 import sys
 from pathlib import Path
@@ -24,7 +24,7 @@ import subprocess
 import tempfile
 import time
 
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 BASE_URL = "https://evren-llmapi.ssyz.org.tr/v1"
 KEY_ENV_VAR = "EVRENAPI"
 KEYCHAIN_SERVICE = "evren"
@@ -34,6 +34,7 @@ DEFAULT_MODEL = "qwen3.8-flash-next"
 DEFAULT_VISION_MODEL = "gemma-4-31b"
 DEFAULT_OCR_MODEL = "dots-ocr"
 DEFAULT_ASR_MODEL = "qwen3-asr-1.7b"
+DEFAULT_RERANK_MODEL = "qwen3-reranker-8b"
 
 # kind -> (environment variable, config key, built-in default)
 MODEL_KINDS = {
@@ -41,6 +42,7 @@ MODEL_KINDS = {
     "vision": ("EVREN_VISION_MODEL", "vision_model", DEFAULT_VISION_MODEL),
     "ocr": ("EVREN_OCR_MODEL", "ocr_model", DEFAULT_OCR_MODEL),
     "asr": ("EVREN_ASR_MODEL", "asr_model", DEFAULT_ASR_MODEL),
+    "rerank": ("EVREN_RERANK_MODEL", "rerank_model", DEFAULT_RERANK_MODEL),
 }
 
 DIM = "\033[2m"
@@ -632,6 +634,75 @@ def cmd_transcribe(argv):
     sys.stderr.write(f"{DIM}[{model}] time {time.monotonic() - start:.1f}s | {size / 1024:.0f} KB{RESET}\n")
 
 
+# ---------------------------------------------------------------- rerank
+
+def read_lines(path_str):
+    path = Path(path_str).expanduser()
+    if not path.is_file():
+        sys.exit(f"Error: file not found: '{path_str}'.")
+    return [ln.strip() for ln in path.read_text().splitlines() if ln.strip()]
+
+
+def cmd_rerank(argv):
+    parser = argparse.ArgumentParser(prog="evren rerank", description="rank documents by relevance to a query")
+    parser.add_argument("query", help="the search query")
+    parser.add_argument("documents", nargs="*", help="documents to rank (or use -f / stdin)")
+    parser.add_argument("-f", "--file", default=None, help="file with one document per line")
+    parser.add_argument("-m", "--model", default=None, help="reranker model (default: qwen3-reranker-8b)")
+    parser.add_argument("-n", "--top-n", type=int, default=None, help="return only the best N documents")
+    parser.add_argument("--raw", action="store_true", help="print the raw JSON response")
+    args = parser.parse_args(argv)
+
+    docs = list(args.documents)
+    if args.file:
+        docs += read_lines(args.file)
+    if not docs and not sys.stdin.isatty():
+        docs += [ln.strip() for ln in sys.stdin.read().splitlines() if ln.strip()]
+    if not docs:
+        sys.exit('Error: no documents. Usage: evren rerank "query" "doc 1" "doc 2"  or  -f docs.txt')
+
+    model, _ = resolve_model("rerank", args.model)
+    body = {"model": model, "query": args.query, "documents": docs}
+    if args.top_n:
+        body["top_n"] = args.top_n
+
+    start = time.monotonic()
+    with httpx.Client(timeout=httpx.Timeout(connect=15, read=120, write=60, pool=15)) as client:
+        resp = client.post(f"{BASE_URL}/rerank", json=body, headers=auth_headers())
+    if resp.status_code != 200:
+        sys.exit(explain_http_error(resp.status_code, resp.text) +
+                 "\nTip: the request fields may differ; check /v1/rerank in the server's openapi.json.")
+    data = resp.json()
+    if args.raw:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+
+    items = data.get("results") or data.get("data") if isinstance(data, dict) else data
+    ranked = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            ranked = []
+            break
+        index = item.get("index")
+        score = item.get("relevance_score", item.get("score"))
+        if not isinstance(index, int) or not isinstance(score, (int, float)) or not 0 <= index < len(docs):
+            ranked = []
+            break
+        ranked.append((score, index))
+    if not ranked:
+        sys.stderr.write("Warning: unexpected response shape, showing the raw JSON.\n")
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+
+    ranked.sort(reverse=True)
+    for position, (score, index) in enumerate(ranked, start=1):
+        text = docs[index] if len(docs[index]) <= 100 else docs[index][:97] + "..."
+        print(f"{position}. {score:.4f}  [{index}] {text}")
+    usage = data.get("usage") if isinstance(data, dict) else None
+    extra = f" | tokens {usage.get('total_tokens')}" if isinstance(usage, dict) and usage.get("total_tokens") else ""
+    sys.stderr.write(f"{DIM}[{model}] {len(docs)} documents | time {time.monotonic() - start:.1f}s{extra}{RESET}\n")
+
+
 # ---------------------------------------------------------------- models
 
 def human_context(n):
@@ -682,10 +753,12 @@ def cmd_setmodel(argv):
     kind_group.add_argument("--vision", action="store_true", help="vision default (used by `img`)")
     kind_group.add_argument("--ocr", action="store_true", help="OCR default (used by `ocr`)")
     kind_group.add_argument("--asr", action="store_true", help="speech-to-text default (used by `transcribe`)")
+    kind_group.add_argument("--rerank", action="store_true", help="reranker default (used by `rerank`)")
     parser.add_argument("--force", action="store_true", help="skip validation against the model list")
     args = parser.parse_args(argv)
 
-    kind = "vision" if args.vision else "ocr" if args.ocr else "asr" if args.asr else "text"
+    kind = ("vision" if args.vision else "ocr" if args.ocr else "asr" if args.asr
+            else "rerank" if args.rerank else "text")
     env_name, cfg_key, _ = MODEL_KINDS[kind]
 
     if not args.force and args.name != "auto":
@@ -788,8 +861,9 @@ COMMANDS = {
     "img": (cmd_img, "ask a question about image(s)"),
     "ocr": (cmd_ocr, "extract text from image(s)"),
     "transcribe": (cmd_transcribe, "speech to text from an audio file"),
+    "rerank": (cmd_rerank, "rank documents by relevance to a query"),
     "models": (cmd_models, "list models with task, inputs and context size"),
-    "setmodel": (cmd_setmodel, "change a default model (--vision, --ocr, --asr)"),
+    "setmodel": (cmd_setmodel, "change a default model (--vision, --ocr, --asr, --rerank)"),
     "whichmodel": (cmd_whichmodel, "show active models and where they come from"),
     "quota": (cmd_quota, "show remaining daily and window quota"),
     "terms": (cmd_terms, "terms of use status (text, accept)"),
@@ -804,6 +878,7 @@ def cmd_help(argv=None):
     print('  evren img photo.jpg "question"  ask about an image')
     print("  evren ocr scan.png              extract text")
     print("  evren transcribe talk.m4a -l tr speech to text")
+    print('  evren rerank "query" -f docs.txt rank documents (one per line)')
     print()
     print("COMMANDS")
     for name, (_, desc) in COMMANDS.items():
@@ -816,7 +891,7 @@ def cmd_help(argv=None):
     print("  --show-thinking        show the thinking text without changing the request")
     print()
     print("MODEL PRIORITY")
-    print("  -m  >  EVREN_MODEL (_VISION/_OCR/_ASR)  >  ~/.config/evren/config.json  >  built-in")
+    print("  -m  >  EVREN_MODEL (_VISION/_OCR/_ASR/_RERANK)  >  ~/.config/evren/config.json  >  built-in")
     print()
     print("API KEY")
     print(f"  {KEY_ENV_VAR} environment variable, or macOS Keychain (service '{KEYCHAIN_SERVICE}')")

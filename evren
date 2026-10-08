@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""evren: unofficial CLI for the EVREN LLM API, v0.5.0"""
+"""evren: unofficial CLI for the EVREN LLM API, v0.5.2"""
 import os
 import sys
 from pathlib import Path
@@ -24,7 +24,7 @@ import subprocess
 import tempfile
 import time
 
-VERSION = "0.5.0"
+VERSION = "0.5.2"
 BASE_URL = "https://evren-llmapi.ssyz.org.tr/v1"
 KEY_ENV_VAR = "EVRENAPI"
 KEYCHAIN_SERVICE = "evren"
@@ -878,7 +878,9 @@ def cmd_help(argv=None):
     print('  evren img photo.jpg "question"  ask about an image')
     print("  evren ocr scan.png              extract text")
     print("  evren transcribe talk.m4a -l tr speech to text")
-    print('  evren rerank "query" -f docs.txt rank documents (one per line)')
+    print('  evren rerank "query" "doc 1" "doc 2"   rank documents (best first)')
+    print('  evren rerank "query" -f docs.txt -n 3  documents from a file, top 3')
+    print('  cat docs.txt | evren rerank "query"    easiest: one document per line on stdin')
     print()
     print("COMMANDS")
     for name, (_, desc) in COMMANDS.items():
@@ -889,6 +891,11 @@ def cmd_help(argv=None):
     print("  -m model  -s system  -t max_tokens  --stream")
     print("  --think / --no-think   ask the model to think / not to think (--think also shows it)")
     print("  --show-thinking        show the thinking text without changing the request")
+    print()
+    print("OTHER OPTIONS")
+    print("  ocr         -m model  -o file  --no-resize")
+    print("  transcribe  -m model  -l lang  -f format  -p prompt  -o file")
+    print("  rerank      -m model  -f file  -n top_n  --raw   (documents: arguments, -f file or stdin)")
     print()
     print("MODEL PRIORITY")
     print("  -m  >  EVREN_MODEL (_VISION/_OCR/_ASR/_RERANK)  >  ~/.config/evren/config.json  >  built-in")
